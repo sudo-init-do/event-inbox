@@ -1,0 +1,65 @@
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: event
+      POSTGRES_PASSWORD: event
+      POSTGRES_DB: event_inbox
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minio
+      MINIO_ROOT_PASSWORD: minio12345
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - miniodata:/data
+
+  createbuckets:
+    image: minio/mc:latest
+    depends_on:
+      - minio
+    entrypoint: >
+      /bin/sh -c "
+      until mc alias set local http://minio:9000 minio minio12345; do sleep 1; done;
+      mc mb -p local/event-payloads || true;
+      mc anonymous set none local/event-payloads || true;
+      exit 0;
+      "
+
+  app:
+    image: event-inbox:dev
+    build: .
+    depends_on:
+      - postgres
+      - minio
+      - createbuckets
+    ports:
+      - "8080:8080"
+    environment:
+      APP_PORT: "8080"
+      DATABASE_URL: "postgres://event:event@postgres:5432/event_inbox?sslmode=disable"
+
+      S3_ENDPOINT: "http://minio:9000"
+      S3_REGION: "us-east-1"
+      S3_BUCKET: "event-payloads"
+      S3_ACCESS_KEY: "minio"
+      S3_SECRET_KEY: "minio12345"
+
+      # Replace this with a real 32-byte base64 key later.
+      # For now, we’ll generate one soon.
+      PAYLOAD_ENC_KEY_B64: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+
+      MAX_BODY_BYTES: "1048576"
+      LOG_LEVEL: "info"
+
+volumes:
+  pgdata:
+  miniodata:
