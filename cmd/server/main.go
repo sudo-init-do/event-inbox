@@ -12,8 +12,12 @@ import (
 
 	"event-inbox/internal/crypto"
 	"event-inbox/internal/db"
+	"event-inbox/internal/endpoints"
 	"event-inbox/internal/ingress"
 	"event-inbox/internal/storage"
+	"event-inbox/internal/worker"
+
+	"github.com/go-chi/chi/v5"
 )
 
 func main() {
@@ -65,16 +69,36 @@ func main() {
 		log.Fatalf("migrations failed: %v", err)
 	}
 
-	handler := &ingress.Handler{
+	// Handlers
+	ing := &ingress.Handler{
 		DB:        pool,
 		S3:        s3,
 		Encryptor: enc,
 		MaxBytes:  maxBytes,
 	}
+	ep := &endpoints.Handler{DB: pool}
 
+	// Router
+	r := chi.NewRouter()
+	r.Mount("/", ing.Routes())
+	r.Mount("/", ep.Routes())
+
+	// Worker
+	workerCtx, workerCancel := context.WithCancel(context.Background())
+	defer workerCancel()
+
+	wrk := &worker.Worker{
+		DB:        pool,
+		S3:        s3,
+		Encryptor: enc,
+		Client:    &http.Client{Timeout: 10 * time.Second},
+	}
+	go wrk.Run(workerCtx)
+
+	// Server
 	srv := &http.Server{
 		Addr:              ":" + port,
-		Handler:           handler.Routes(),
+		Handler:           r,
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
@@ -85,13 +109,18 @@ func main() {
 		}
 	}()
 
+	// Shutdown
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	<-sigCh
 
 	log.Println("shutting down...")
+
+	workerCancel()
+
 	ctx, cancel2 := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel2()
 	_ = srv.Shutdown(ctx)
+
 	log.Println("bye")
 }

@@ -28,6 +28,7 @@ func NewEncryptorFromB64(b64 string) (*Encryptor, error) {
 	return &Encryptor{key: key}, nil
 }
 
+// Encrypt returns nonce || ciphertext (GCM tag is included in ciphertext).
 func (e *Encryptor) Encrypt(plaintext []byte) ([]byte, error) {
 	block, err := aes.NewCipher(e.key)
 	if err != nil {
@@ -46,4 +47,31 @@ func (e *Encryptor) Encrypt(plaintext []byte) ([]byte, error) {
 
 	ciphertext := gcm.Seal(nil, nonce, plaintext, nil)
 	return append(nonce, ciphertext...), nil
+}
+
+// Decrypt expects nonce || ciphertext (with GCM tag included).
+func (e *Encryptor) Decrypt(cipherblob []byte) ([]byte, error) {
+	block, err := aes.NewCipher(e.key)
+	if err != nil {
+		return nil, err
+	}
+
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+
+	ns := gcm.NonceSize()
+	if len(cipherblob) < ns {
+		return nil, fmt.Errorf("ciphertext too short")
+	}
+
+	nonce := cipherblob[:ns]
+	ciphertext := cipherblob[ns:]
+
+	plaintext, err := gcm.Open(nil, nonce, ciphertext, nil)
+	if err != nil {
+		return nil, err
+	}
+	return plaintext, nil
 }
