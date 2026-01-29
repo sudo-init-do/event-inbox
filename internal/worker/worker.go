@@ -3,6 +3,9 @@ package worker
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"net/http"
 	"time"
@@ -28,17 +31,21 @@ type job struct {
 	TenantID   string
 	EndpointID string
 
-	DeliveryURL string
-	ObjectKey   string
-	ContentType string
-
-	AttemptCount int
-	MaxAttempts  int
-	InitialBack  int
-	MaxBack      int
+	DeliveryURL    string
+	SigningSecret  string
+	ObjectKey      string
+	ContentType    string
+	AttemptCount   int
+	MaxAttempts    int
+	InitialBackoff int
+	MaxBackoff     int
 }
 
 func (w *Worker) Run(ctx context.Context) {
+	if w.Client == nil {
+		w.Client = &http.Client{Timeout: 10 * time.Second}
+	}
+
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 
@@ -53,11 +60,6 @@ func (w *Worker) Run(ctx context.Context) {
 }
 
 func (w *Worker) processOne(ctx context.Context) error {
-	if w.Client == nil {
-		w.Client = &http.Client{Timeout: 10 * time.Second}
-	}
-
-	// Claim one job safely
 	tx, err := w.DB.Begin(ctx)
 	if err != nil {
 		return err
@@ -81,8 +83,9 @@ func (w *Worker) processOne(ctx context.Context) error {
 			d.tenant_id,
 			d.endpoint_id,
 			e.delivery_url,
+			COALESCE(e.signing_secret,''),
 			we.payload_object_key,
-			we.content_type,
+			COALESCE(we.content_type,''),
 			d.attempt_count,
 			e.max_attempts,
 			e.initial_backoff_seconds,
@@ -98,16 +101,16 @@ func (w *Worker) processOne(ctx context.Context) error {
 		&j.TenantID,
 		&j.EndpointID,
 		&j.DeliveryURL,
+		&j.SigningSecret,
 		&j.ObjectKey,
 		&j.ContentType,
 		&j.AttemptCount,
 		&j.MaxAttempts,
-		&j.InitialBack,
-		&j.MaxBack,
+		&j.InitialBackoff,
+		&j.MaxBackoff,
 	)
 
 	if err != nil {
-		// No job ready is normal
 		_ = tx.Commit(ctx)
 		return nil
 	}
@@ -136,7 +139,6 @@ func (w *Worker) processOne(ctx context.Context) error {
 		return w.failAndSchedule(ctx, j, 0, fmt.Sprintf("decrypt failed: %v", err))
 	}
 
-	// Forward exact bytes
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, j.DeliveryURL, bytes.NewReader(plain))
 	if err != nil {
 		return w.failAndSchedule(ctx, j, 0, fmt.Sprintf("build request: %v", err))
@@ -148,10 +150,19 @@ func (w *Worker) processOne(ctx context.Context) error {
 		req.Header.Set("Content-Type", "application/octet-stream")
 	}
 
+	// Metadata headers (helpful for debugging + tracing)
 	req.Header.Set("X-Event-Inbox-Event-ID", j.EventID.String())
 	req.Header.Set("X-Event-Inbox-Delivery-ID", j.DeliveryID.String())
 	req.Header.Set("X-Event-Inbox-Tenant-ID", j.TenantID)
 	req.Header.Set("X-Event-Inbox-Endpoint-ID", j.EndpointID)
+
+	// Signature headers (fintechs love this)
+	if j.SigningSecret != "" {
+		ts := time.Now().Unix()
+		sig := sign(j.SigningSecret, ts, plain)
+		req.Header.Set("X-Event-Inbox-Timestamp", fmt.Sprintf("%d", ts))
+		req.Header.Set("X-Event-Inbox-Signature", "v1="+sig)
+	}
 
 	resp, err := w.Client.Do(req)
 	if err != nil {
@@ -176,16 +187,18 @@ func (w *Worker) processOne(ctx context.Context) error {
 
 func (w *Worker) failAndSchedule(ctx context.Context, j job, statusCode int, errMsg string) error {
 	attempt := j.AttemptCount + 1
+
 	maxAttempts := j.MaxAttempts
 	if maxAttempts <= 0 {
 		maxAttempts = 12
 	}
 
-	initial := j.InitialBack
+	initial := j.InitialBackoff
 	if initial <= 0 {
 		initial = 5
 	}
-	maxBack := j.MaxBack
+
+	maxBack := j.MaxBackoff
 	if maxBack <= 0 {
 		maxBack = 600
 	}
@@ -223,6 +236,14 @@ func (w *Worker) failAndSchedule(ctx context.Context, j job, statusCode int, err
 	`, j.DeliveryID, attempt, next, nullIfZero(statusCode), errMsg)
 
 	return nil
+}
+
+func sign(secret string, ts int64, payload []byte) string {
+	mac := hmac.New(sha256.New, []byte(secret))
+	// message = "<ts>.<payload>"
+	_, _ = mac.Write([]byte(fmt.Sprintf("%d.", ts)))
+	_, _ = mac.Write(payload)
+	return hex.EncodeToString(mac.Sum(nil))
 }
 
 func min(a, b int) int {
